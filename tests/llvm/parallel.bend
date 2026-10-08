@@ -1,0 +1,14 @@
+import Base
+
+def pow2(+n: Nat) -> U32:
+  match n:
+    case 0n:
+      1
+    case 1n+p:
+      a b = pow2!(p) pow2!(p)
+      U32.add(a, b)
+
+def main() -> IO(Unit):
+  IO.print(U32.show(pow2!(4n)))
+
+#|16

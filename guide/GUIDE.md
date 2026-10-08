@@ -547,6 +547,9 @@ Bend is a single command:
 bend file.bend            # check; run main (IO compiled; a value normalized)
 bend file.bend -o file    # compile to a native binary (clang 14+; 19+ with `!`)
 bend file.bend -o file.c  # emit the C source instead
+bend file.bend -o file.ll # emit LLVM IR directly
+bend file.bend --llvm -o file # build a CPU binary from LLVM IR
+bend file.bend --llvm arg # build and run a temporary CPU binary
 bend file.bend -o file.js # emit the JS source instead
 bend file.bend -o f.mjs   # emit an ES module of its non-IO defs, for JS to import
 bend file.bend --verdict  # check; then recheck with the proven BendTT kernel
@@ -556,14 +559,21 @@ bend page.html -o dist    # bundle a web page that imports .bend files
 ./file --gpu 4GB          # cap the GPU's heap at 4GB
 ```
 
-A `main` that returns `IO` runs compiled; one that returns a value is normalized
-by the checker (slow for big work) and printed; a file with no `main` just
-checks. A binary that uses `!` builds its GPU program too, as `file.gpu`, which
-must stay beside it: on macOS it needs Metal, on Linux CUDA 12 or 13 at
-`$CUDA_HOME`, `/usr/local/cuda` or `/opt/cuda`. On Linux a program with a
-Window needs `libx11-dev`, one with Audio `libasound2-dev`. `bend guide` prints
-this text, `bend base` prints the Base library (`bend base Map` prints one name
-and everything under it), and `bend --help` lists the other commands.
+By default, IO `main` runs compiled; value `main` normalizes and prints, slowly
+for big work; no `main` just checks. Native `!` builds need `file.gpu` beside
+the binary, Metal on macOS or CUDA 12/13 at `$CUDA_HOME`, `/usr/local/cuda` or
+`/opt/cuda` on Linux. Linux Window/Audio need `libx11-dev`/`libasound2-dev`.
+`bend guide` prints this guide; `bend base Map` prints Map's declarations;
+`bend base` prints all Base; `bend --help` lists commands.
+
+Experimental LLVM builds use `LLVM_CC`/clang 14+ and `RUSTC`/rustc, compiling
+IR and linking the Rust runtime without C. `.ll` emission needs neither tool.
+Ship `llvm_runtime.rs` beside `base.bend`. `!` is inert; parallel bindings use
+CPU workers. Forward runtime options with `--llvm -- --threads 4`.
+Supported IO is print/write/print_err/args/get_env/random_u32/sleep/now/thread_count;
+other reachable foreign effects fail compilation. Pure functions print
+`<function>`; erased proofs print `()`. Run `bun tests/llvm/run.js --existing`
+for regressions, or `--all` for all CPU test namespaces.
 
 ## Syntax Reference
 
@@ -636,28 +646,22 @@ A `Nat` literal past `256n` is `U32.to_nat(n)` underneath, up to `4294967295n`.
 
 ## Under the Hood
 
-Bend's compiler emits one C file, and that file is both the CPU program and the
-GPU kernel. clang compiles it for the CPU. Metal (on Apple) or CUDA (on NVIDIA)
-compiles the same file for the GPU. So a `!` call runs the same code on
-whichever chip it lands on.
+The default backend emits one C file for clang on CPUs, Metal on Apple GPUs,
+and CUDA on NVIDIA GPUs. LLVM emits CPU IR linked with the Rust runtime.
 
-A term is one 64-bit word: small values are stored inline, everything else is a
-pointer into a single heap shared by every core and by the GPU. There is no
-garbage collector. Since values are affine, a `match` frees the node it opens
-on the spot, and only `+` values carry a reference count. There is no C stack
-either: each def compiles to a segment of a flat state machine, a call is a
-jump, and a parallel call creates a join task plus one task per call, which the
-scheduler deals across CPU or GPU lanes. `paper/BendRT.pdf` has the design and
-the benchmarks.
+The default runtime uses 64-bit terms: small values inline, others pointing
+into one heap shared by CPU cores and GPU. Affine `match` frees its node;
+only `+` values need reference counts, with no garbage collector. Definitions
+are segments of a flat state machine, calls are jumps, and parallel calls
+create join and call tasks scheduled across CPU/GPU lanes. There is no C stack.
+`paper/BendRT.pdf` describes the design and benchmarks.
 
-Bend's theory has one universe and no positivity check: `Type : Type` holds,
-and a datatype may recurse on the left of an arrow. What keeps this consistent
-is a wall between two checking modes. Code that runs is checked *live*; types,
-erased arguments and equations are checked *dead*. Dead code may loop forever or
-inhabit `Empty`, but nothing dead ever counts as live evidence, and live
-recursion must terminate. `bend2/bendtt.lean` is BendTT's kernel in Lean, with
-a proof that no def it accepts has type `Empty` and that live code halts;
-`--verdict` checks a file with it. `paper/BendTT.pdf` is the paper.
+Bend has `Type : Type` and no positivity check; datatypes may recurse left
+of an arrow. Executable code is checked *live*; types, erased arguments and
+equations are checked *dead*. Dead code may loop or inhabit `Empty` but cannot
+provide live evidence; live recursion must terminate. `bend2/bendtt.lean`
+proves its kernel accepts no `Empty` def and live code halts. `--verdict`
+checks files with it; `paper/BendTT.pdf` explains the theory.
 
 ## Further Reading
 
@@ -667,11 +671,7 @@ a proof that no def it accepts has type `Empty` and that live code halts;
 
 ## Extra
 
-`bend guide shaders` prints "Shaders in Bend", a tutorial written by AIs for
-AIs on how to write efficient shaders in Bend. It distills what building
-`demos/app_slash_boss_3d` (120 FPS in pure Bend) taught. Read it before you
-write a graphical or parallel app in Bend.
-
-`bend guide effects` prints "Effects in Bend", an AI-written note (to be
-revised by a human) on the C and JS side of custom effects. Read it before
-you write one.
+Before writing graphical or parallel apps, read `bend guide shaders`, the
+AI-written tutorial based on `demos/app_slash_boss_3d` (120 FPS in pure Bend).
+Before writing custom effects, read `bend guide effects`, an AI-written C/JS
+guide awaiting human revision.
