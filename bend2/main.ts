@@ -38,7 +38,7 @@ const USAGE = [
   ["bend <file.bend> [args]", "check the file, then run main with args"],
   ["bend <file.bend> -o <out>", "build a binary, or C, JS, .mjs or BendTT by extension"],
   ["bend <file.bend> -o <out.ll>", "emit LLVM IR directly"],
-  ["bend <file.bend> --llvm -o <out>", "build a CPU binary from LLVM IR and the Rust runtime"],
+  ["bend <file.bend> --llvm -o <out>", "build a CPU binary from LLVM IR"],
   ["bend <file.bend> --llvm [args]", "build and run a CPU binary from LLVM IR"],
   ["bend <file.bend> --check-only", "check the file and its imports; run nothing"],
   ["bend <file.bend> --verdict", "check it, then recheck it with the proven kernel"],
@@ -439,7 +439,8 @@ function llvm_run(book: Bend.Book, file: string, argv: string[]): number {
 
 function llvm_build(bin: string, ir: string): void {
   const clang = llvm_clang();
-  const runtime = llvm_runtime();
+  const standalone = /^; bend-runtime: none$/m.test(fs.readFileSync(ir, "utf8"));
+  const runtime = standalone ? null : llvm_runtime();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend-llvm-build-"));
   const obj = path.join(dir, "program.o");
   try {
@@ -453,10 +454,11 @@ function llvm_build(bin: string, ir: string): void {
     }
     // clang links libSystem by default on Darwin; libc and libm alias it.
     // Keep the archive's other native arguments in their reported order.
-    const libs = process.platform === "darwin" && runtime.libs.includes("-lSystem")
-      ? runtime.libs.filter((arg) => !["-lSystem", "-lc", "-lm"].includes(arg))
-      : runtime.libs;
-    const link = child.spawnSync(clang, ["-O3", obj, runtime.file,
+    const native = runtime?.libs ?? (process.platform === "linux" ? ["-lm"] : []);
+    const libs = process.platform === "darwin" && native.includes("-lSystem")
+      ? native.filter((arg) => !["-lSystem", "-lc", "-lm"].includes(arg))
+      : native;
+    const link = child.spawnSync(clang, ["-O3", obj, ...(runtime === null ? [] : [runtime.file]),
       ...libs, "-o", path.resolve(bin)], { stdio: "inherit" });
     if (link.error !== undefined) {
       throw "Error: could not run " + path.basename(clang) + ": " + link.error.message;

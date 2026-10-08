@@ -566,14 +566,18 @@ the binary, Metal on macOS or CUDA 12/13 at `$CUDA_HOME`, `/usr/local/cuda` or
 `bend guide` prints this guide; `bend base Map` prints Map's declarations;
 `bend base` prints all Base; `bend --help` lists commands.
 
-Experimental LLVM builds use `LLVM_CC`/clang 14+ and `RUSTC`/rustc, compiling
-IR and linking the Rust runtime without C. `.ll` emission needs neither tool.
-Ship `llvm_runtime.rs` beside `base.bend`. `!` is inert; parallel bindings use
-CPU workers. Forward runtime options with `--llvm -- --threads 4`.
-Supported IO is print/write/print_err/args/get_env/random_u32/sleep/now/thread_count;
-other reachable foreign effects fail compilation. Pure functions print
-`<function>`; erased proofs print `()`. Run `bun tests/llvm/run.js --existing`
-for regressions, or `--all` for all CPU test namespaces.
+LLVM needs clang 14+ (`LLVM_CC`); mixed/IO builds also need rustc (`RUSTC`).
+Native-only and `.ll` builds need no Rust. Clang handles IR and linking; Bend
+generates no C. Ship `llvm_runtime.rs` beside `base.bend`. `!` is inert;
+parallel calls use CPU workers. Pass flags after `--llvm --`, e.g. `--threads 4`.
+IO supports print/write/print_err/args/get_env/random_u32/sleep/now/thread_count;
+other reachable foreign effects fail. Pure functions print `<function>`;
+erased proofs print `()`. Run `bun tests/llvm/run.js --existing` or `--all`.
+Run runtime unit tests with:
+
+```sh
+rustc --edition=2021 --test bend2/llvm_runtime.rs -o /tmp/bend-llvm-runtime-tests && /tmp/bend-llvm-runtime-tests
+```
 
 ## Syntax Reference
 
@@ -646,15 +650,13 @@ A `Nat` literal past `256n` is `U32.to_nat(n)` underneath, up to `4294967295n`.
 
 ## Under the Hood
 
-The default backend emits one C file for clang on CPUs, Metal on Apple GPUs,
-and CUDA on NVIDIA GPUs. LLVM emits CPU IR linked with the Rust runtime.
+The default backend emits C, Metal or CUDA. LLVM uses native scalar layouts and
+links Rust only for heap, IO or scheduling.
 
-The default runtime uses 64-bit terms: small values inline, others pointing
-into one heap shared by CPU cores and GPU. Affine `match` frees its node;
-only `+` values need reference counts, with no garbage collector. Definitions
-are segments of a flat state machine, calls are jumps, and parallel calls
-create join and call tasks scheduled across CPU/GPU lanes. There is no C stack.
-`paper/BendRT.pdf` describes the design and benchmarks.
+The default runtime uses 64-bit terms, with one heap shared by CPU cores and
+GPU. Affine `match` frees its node; only `+` values need reference counts.
+Definitions form a flat state machine; calls are jumps, and parallel calls
+create scheduler tasks. `paper/BendRT.pdf` describes the design and benchmarks.
 
 Bend has `Type : Type` and no positivity check; datatypes may recurse left
 of an arrow. Executable code is checked *live*; types, erased arguments and

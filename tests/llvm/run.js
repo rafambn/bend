@@ -49,6 +49,10 @@ function tidy(text) {
   return text.replace(/[ \t]+$/gm, "").trim();
 }
 
+function native_scalar_call(ir) {
+  return /\bcall\b[^\n]*@bend_(?:(?:u32|f32|nat)\(|op_(?:u32|f32|nat|bool)_[A-Za-z0-9_]+\()/.test(ir);
+}
+
 function bend_files(dir) {
   return fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
     a.name < b.name ? -1 : a.name > b.name ? 1 : 0).flatMap((entry) => {
@@ -157,27 +161,277 @@ try {
     LLVM_CC: "bend-missing-clang",
     RUSTC: "bend-missing-rustc",
   });
+  const scalarIR = fs.existsSync(ir) ? fs.readFileSync(ir, "utf8") : "";
   const emitOk = emitted.error === null && emitted.status === 0
-    && fs.existsSync(ir) && /define\s+i32\s+@main\b/.test(fs.readFileSync(ir, "utf8"));
+    && /define\s+i32\s+@main\b/.test(scalarIR)
+    && /^; bend-runtime: rust$/m.test(scalarIR) && !native_scalar_call(scalarIR);
   console.log((emitOk ? "PASS " : "FAIL ") + "LLVM IR emission without native tools");
   if (!emitOk) console.error(emitted.stderr || emitted.error?.message || "invalid IR output");
   passed += Number(emitOk);
   total += 1;
 
-  const binary = path.join(temp, "pure-main");
-  const built = await invoke(path.join(DIR, "pure_main.bend"),
-    ["--llvm", "-o", binary]);
+  const mixedFile = path.join(DIR, "mixed_native_scalar_call.bend");
+  const mixedIRFile = path.join(temp, "mixed-native-scalar-call.ll");
+  const mixedResult = await invoke(mixedFile, ["-o", mixedIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const mixedIR = fs.existsSync(mixedIRFile) ? fs.readFileSync(mixedIRFile, "utf8") : "";
+  const mixedFunctions = [...mixedIR.matchAll(
+    /^define\s+([^\n{]+)\{\n([\s\S]*?)^\}/gm,
+  )];
+  const mixedNativeCall = mixedFunctions.some(([, signature, body]) =>
+    !signature.includes("@bend_native_")
+      && /\bcall\b[^\n]*@bend_native_[A-Za-z0-9_]*/.test(body));
+  const mixedIRok = mixedResult.error === null && mixedResult.status === 0
+    && /^; bend-runtime: rust$/m.test(mixedIR) && mixedNativeCall;
+  console.log((mixedIRok ? "PASS " : "FAIL ")
+    + "mixed LLVM path calls typed scalar kernel directly");
+  if (!mixedIRok) {
+    console.error(mixedResult.stderr || mixedResult.error?.message
+      || "mixed IR lacks a direct native-kernel call from a general function");
+  }
+  passed += Number(mixedIRok);
+  total += 1;
+
+  const parallelFile = path.join(DIR, "parallel_native_call.bend");
+  const parallelIRFile = path.join(temp, "parallel-native-call.ll");
+  const parallelResult = await invoke(parallelFile, ["-o", parallelIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const parallelIR = fs.existsSync(parallelIRFile)
+    ? fs.readFileSync(parallelIRFile, "utf8") : "";
+  const parallelFunctions = [...parallelIR.matchAll(
+    /^define\s+([^\n{]+)\{\n([\s\S]*?)^\}/gm,
+  )];
+  const parallelNativeCall = parallelFunctions.some(([, signature, body]) =>
+    !signature.includes("@bend_native_")
+      && /\bcall\b[^\n]*@bend_native_[A-Za-z0-9_]*/.test(body));
+  const parallelIROk = parallelResult.error === null && parallelResult.status === 0
+    && /^; bend-runtime: rust$/m.test(parallelIR)
+    && /\bcall\s+i64\s+@bend_cpu_fork\(i64\s/.test(parallelIR)
+    && /\bcall\s+i64\s+@bend_cpu_join\(i64\s/.test(parallelIR)
+    && parallelNativeCall;
+  console.log((parallelIROk ? "PASS " : "FAIL ")
+    + "marked native kernels run through CPU fork/join workers");
+  if (!parallelIROk) {
+    console.error(parallelResult.stderr || parallelResult.error?.message
+      || "parallel IR lacks CPU fork/join or a direct native worker call");
+  }
+  passed += Number(parallelIROk);
+  total += 1;
+
+  const arithmeticFile = path.join(DIR, "native_arithmetic.bend");
+  const arithmeticIRFile = path.join(temp, "native-arithmetic.ll");
+  const nativeIR = await invoke(arithmeticFile, ["-o", arithmeticIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const arithmeticIR = fs.existsSync(arithmeticIRFile)
+    ? fs.readFileSync(arithmeticIRFile, "utf8") : "";
+  const nativeTypes = new Set([...arithmeticIR.matchAll(
+    /^define\s+(i32|float|i64|i1)\s+@bend_native_[^\s(]+\(/gm,
+  )].map((match) => match[1]));
+  const arithmeticIrOk = nativeIR.error === null && nativeIR.status === 0
+    && /^; bend-runtime: none$/m.test(arithmeticIR)
+    && /^define\s+i32\s+@bend_main\(/m.test(arithmeticIR)
+    && ["i32", "float", "i64", "i1"].every((type) => nativeTypes.has(type))
+    && /\badd i32\b/.test(arithmeticIR)
+    && /\bfadd float\b/.test(arithmeticIR)
+    && /\badd i64\b/.test(arithmeticIR)
+    && !native_scalar_call(arithmeticIR);
+  console.log((arithmeticIrOk ? "PASS " : "FAIL ")
+    + "native scalar IR uses typed functions and arithmetic");
+  if (!arithmeticIrOk) {
+    console.error(nativeIR.stderr || nativeIR.error?.message
+      || "native scalar IR lacks typed signatures, arithmetic, or runtime marker");
+  }
+  passed += Number(arithmeticIrOk);
+  total += 1;
+
+  const shiftsFile = path.join(DIR, "native_nat_shifts.bend");
+  const shiftsIRFile = path.join(temp, "native-nat-shifts.ll");
+  const shiftsResult = await invoke(shiftsFile, ["-o", shiftsIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const shiftsIR = fs.existsSync(shiftsIRFile) ? fs.readFileSync(shiftsIRFile, "utf8") : "";
+  const natShiftFn = /^define\s+i32\s+@bend_native_[^\s(]+\(\s*i32\s+[^,()]+,\s*i64\s+[^,()]+\s*\)/m
+    .test(shiftsIR);
+  const shiftsIrOk = shiftsResult.error === null && shiftsResult.status === 0
+    && /^; bend-runtime: none$/m.test(shiftsIR)
+    && natShiftFn
+    && /\bicmp\s+uge\s+i64\b/.test(shiftsIR)
+    && /\btrunc\s+i64\s+[^\n]+\s+to\s+i32\b/.test(shiftsIR)
+    && !native_scalar_call(shiftsIR);
+  console.log((shiftsIrOk ? "PASS " : "FAIL ")
+    + "native Nat shifts compare the full count before narrowing");
+  if (!shiftsIrOk) {
+    console.error(shiftsResult.stderr || shiftsResult.error?.message
+      || "Nat shift IR lacks a typed i64 count or full-width bounds check");
+  }
+  passed += Number(shiftsIrOk);
+  total += 1;
+
+  const higherOrderFile = path.join(DIR, "mixed_higher_order_nat_shifts.bend");
+  const higherOrderIRFile = path.join(temp, "mixed-higher-order-nat-shifts.ll");
+  const higherOrderResult = await invoke(higherOrderFile, ["-o", higherOrderIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const higherOrderIR = fs.existsSync(higherOrderIRFile)
+    ? fs.readFileSync(higherOrderIRFile, "utf8") : "";
+  const higherOrderIRok = higherOrderResult.error === null && higherOrderResult.status === 0
+    && /^; bend-runtime: rust$/m.test(higherOrderIR)
+    && /\bcall\s+i64\s+@bend_apply\(i64\s/.test(higherOrderIR)
+    && /\bdefine\s+i64\s+@bend_op_u32_shln_\d+\(/.test(higherOrderIR)
+    && /\bdefine\s+i64\s+@bend_op_u32_shrn_\d+\(/.test(higherOrderIR);
+  console.log((higherOrderIRok ? "PASS " : "FAIL ")
+    + "higher-order Nat shifts use generic operation callbacks");
+  if (!higherOrderIRok) {
+    console.error(higherOrderResult.stderr || higherOrderResult.error?.message
+      || "higher-order shift IR lacks the Rust callback path");
+  }
+  passed += Number(higherOrderIRok);
+  total += 1;
+
+  const bitsFile = path.join(DIR, "native_f32_u32_bits.bend");
+  const bitsIRFile = path.join(temp, "native-f32-u32-bits.ll");
+  const bitsResult = await invoke(bitsFile, ["-o", bitsIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const bitsIR = fs.existsSync(bitsIRFile) ? fs.readFileSync(bitsIRFile, "utf8") : "";
+  const bitsIrOk = bitsResult.error === null && bitsResult.status === 0
+    && /^; bend-runtime: none$/m.test(bitsIR)
+    && /^define\s+i32\s+@bend_main\(/m.test(bitsIR)
+    && /\bbitcast\s+i32\s+[^\n,]+\s+to\s+float\b/.test(bitsIR)
+    && /\bbitcast\s+float\s+[^\n,]+\s+to\s+i32\b/.test(bitsIR)
+    && !native_scalar_call(bitsIR);
+  console.log((bitsIrOk ? "PASS " : "FAIL ")
+    + "F32/U32 Word reinterpretation stays in native LLVM IR");
+  if (!bitsIrOk) {
+    console.error(bitsResult.stderr || bitsResult.error?.message
+      || "F32/U32 bitcast IR needs a runtime bridge or lacks native bitcasts");
+  }
+  passed += Number(bitsIrOk);
+  total += 1;
+
+  const unionFile = path.join(DIR, "native_scalar_union.bend");
+  const unionIRFile = path.join(temp, "native-scalar-union.ll");
+  const unionResult = await invoke(unionFile, ["-o", unionIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const unionIR = fs.existsSync(unionIRFile) ? fs.readFileSync(unionIRFile, "utf8") : "";
+  const unionIrOk = unionResult.error === null && unionResult.status === 0
+    && /^; bend-runtime: none$/m.test(unionIR)
+    && /^define\s+i32\s+@bend_main\(/m.test(unionIR)
+    && /^define\s+i32\s+@bend_native_[^\s(]+\(/m.test(unionIR)
+    && !native_scalar_call(unionIR)
+    && !/\bcall\b[^\n]*@bend_(?:ctor|plain_ctor|apply|capture|field|tag)\b/.test(unionIR);
+  console.log((unionIrOk ? "PASS " : "FAIL ")
+    + "U32/F32 ADT arms lower to a native scalar result");
+  if (!unionIrOk) {
+    console.error(unionResult.stderr || unionResult.error?.message
+      || "U32/F32 union IR uses a runtime bridge or lacks native functions");
+  }
+  passed += Number(unionIrOk);
+  total += 1;
+
+  const wordFile = path.join(DIR, "native_word_bridge.bend");
+  const wordIRFile = path.join(temp, "native-word-bridge.ll");
+  const wordResult = await invoke(wordFile, ["-o", wordIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const wordIR = fs.existsSync(wordIRFile) ? fs.readFileSync(wordIRFile, "utf8") : "";
+  const wordValueArg = /^define\s+i32\s+@bend_native_[^\s(]+\(\s*i32\s+[^,()]+\s*\)/m
+    .test(wordIR);
+  const wordIrOk = wordResult.error === null && wordResult.status === 0
+    && /^; bend-runtime: none$/m.test(wordIR)
+    && /^define\s+i32\s+@bend_main\(/m.test(wordIR)
+    && wordValueArg
+    && !native_scalar_call(wordIR)
+    && !/\bcall\b[^\n]*@bend_(?:ctor|plain_ctor|apply|capture)\b/.test(wordIR);
+  console.log((wordIrOk ? "PASS " : "FAIL ")
+    + "Word-to-U32 construction and matching stay native");
+  if (!wordIrOk) {
+    console.error(wordResult.stderr || wordResult.error?.message
+      || "Word/U32 IR uses a runtime bridge or lacks native signatures");
+  }
+  passed += Number(wordIrOk);
+  total += 1;
+
+  const floatFile = path.join(DIR, "native_float_print.bend");
+  const floatIRFile = path.join(temp, "native-float-print.ll");
+  const floatIRResult = await invoke(floatFile, ["-o", floatIRFile], {
+    ...process.env,
+    PATH: emptyPath,
+    LLVM_CC: "bend-missing-clang",
+    RUSTC: "bend-missing-rustc",
+  });
+  const floatIR = fs.existsSync(floatIRFile) ? fs.readFileSync(floatIRFile, "utf8") : "";
+  const floatIrOk = floatIRResult.error === null && floatIRResult.status === 0
+    && /^; bend-runtime: none$/m.test(floatIR)
+    && !native_scalar_call(floatIR);
+  console.log((floatIrOk ? "PASS " : "FAIL ")
+    + "native F32 printer emits IR without Rust runtime");
+  if (!floatIrOk) {
+    console.error(floatIRResult.stderr || floatIRResult.error?.message
+      || "F32 printer IR needs the Rust runtime or scalar boxing helpers");
+  }
+  passed += Number(floatIrOk);
+  total += 1;
+
+  const binary = path.join(temp, "native-arithmetic");
+  const built = await invoke(arithmeticFile,
+    ["--llvm", "-o", binary], { ...process.env, RUSTC: "bend-missing-rustc" });
   const pure = built.status === 0 && built.error === null
     ? await run(binary, []) : built;
   const buildOk = pure.error === null && pure.status === 0
-    && tidy(pure.stdout) === want(path.join(DIR, "pure_main.bend")).output;
-  console.log((buildOk ? "PASS " : "FAIL ") + "native binary build and run");
+    && tidy(pure.stdout) === want(arithmeticFile).output;
+  console.log((buildOk ? "PASS " : "FAIL ")
+    + "native binary runs without Rust runtime");
   if (!buildOk) {
     console.error("  expected: "
-      + JSON.stringify(want(path.join(DIR, "pure_main.bend")).output));
+      + JSON.stringify(want(arithmeticFile).output));
     console.error("  observed: " + JSON.stringify(tidy(pure.stdout + pure.stderr)));
   }
   passed += Number(buildOk);
+  total += 1;
+
+  const floatBinary = path.join(temp, "native-float-print");
+  const floatBuilt = await invoke(floatFile,
+    ["--llvm", "-o", floatBinary], { ...process.env, RUSTC: "bend-missing-rustc" });
+  const floatRun = floatBuilt.status === 0 && floatBuilt.error === null
+    ? await run(floatBinary, []) : floatBuilt;
+  const floatBuildOk = floatRun.error === null && floatRun.status === 0
+    && tidy(floatRun.stdout) === want(floatFile).output;
+  console.log((floatBuildOk ? "PASS " : "FAIL ")
+    + "native F32 printer matches JS output without Rust");
+  if (!floatBuildOk) {
+    console.error("  expected: " + JSON.stringify(want(floatFile).output));
+    console.error("  observed: " + JSON.stringify(tidy(floatRun.stdout + floatRun.stderr)));
+  }
+  passed += Number(floatBuildOk);
   total += 1;
 
   let rejectedTargets = true;

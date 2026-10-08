@@ -20,9 +20,64 @@ use std::time::{Duration, Instant};
 type Value = u64;
 type BendFn = unsafe extern "C" fn(Value, Value) -> Value;
 
+const TAG_SHIFT: u32 = 48;
+const PAYLOAD_MASK: Value = (1 << TAG_SHIFT) - 1;
+const TAG_U32: u16 = 0x1001;
+const TAG_F32: u16 = 0x1002;
+const TAG_NAT: u16 = 0x1003;
+const TAG_CHAR: u16 = 0x1004;
+const TAG_BOOL: u16 = 0x1005;
+const TAG_WORD: u16 = 0x1006;
+
+fn immediate(tag: u16, payload: Value) -> Value {
+    ((tag as Value) << TAG_SHIFT) | (payload & PAYLOAD_MASK)
+}
+
+fn value_tag(value: Value) -> u16 {
+    (value >> TAG_SHIFT) as u16
+}
+
+fn u32_immediate(value: u32) -> Value {
+    immediate(TAG_U32, value as Value)
+}
+
+fn f32_immediate(value: f32) -> Value {
+    immediate(TAG_F32, value.to_bits() as Value)
+}
+
+fn nat_immediate(value: u64) -> Value {
+    const NAT_MAX: u64 = (1 << 48) - 1;
+    if value > NAT_MAX {
+        fail("a Nat past the largest immediate 2^48-1");
+    }
+    immediate(TAG_NAT, value)
+}
+
+fn char_immediate(value: char) -> Value {
+    immediate(TAG_CHAR, value as Value)
+}
+
+fn bool_immediate(value: bool) -> Value {
+    immediate(TAG_BOOL, Value::from(value))
+}
+
+fn word_immediate(length: u8, bits: u32) -> Value {
+    debug_assert!(length <= 32);
+    immediate(TAG_WORD, ((length as Value) << 32) | bits as Value)
+}
+
+fn word_parts(value: Value) -> Option<(u8, u32)> {
+    if value_tag(value) != TAG_WORD {
+        return None;
+    }
+    let length = ((value >> 32) & 0xffff) as u16;
+    (length <= 32).then_some((length as u8, value as u32))
+}
+
 struct Ctor {
     tag: Value,
     fields: Vec<Value>,
+    plain: bool,
 }
 
 struct Closure {
@@ -53,10 +108,6 @@ struct TaskResult {
 }
 
 enum Object {
-    Nat(u64),
-    U32(u32),
-    F32(f32),
-    Char(char),
     String(String),
     Ctor(Ctor),
     Array(Array),
@@ -132,7 +183,9 @@ fn alloc(object: Object) -> Value {
 }
 
 fn is_handle(value: Value) -> bool {
-    value > 4096 && value as usize % std::mem::align_of::<RuntimeObject>() == 0
+    value > 4096
+        && value >> TAG_SHIFT == 0
+        && value as usize % std::mem::align_of::<RuntimeObject>() == 0
 }
 
 unsafe fn object<'a>(value: Value) -> Option<&'a Object> {
@@ -434,14 +487,46 @@ fn take_region_result(closure: Value) -> TaskResult {
 unsafe impl Send for TaskResult {}
 
 fn alloc_named_ctor(tag: Value, fields: Vec<Value>) -> Value {
-    alloc(Object::Ctor(Ctor { tag, fields }))
+    alloc(Object::Ctor(Ctor {
+        tag,
+        fields,
+        plain: false,
+    }))
+}
+
+fn alloc_plain_ctor(tag: Value, fields: Vec<Value>) -> Value {
+    alloc(Object::Ctor(Ctor {
+        tag,
+        fields,
+        plain: true,
+    }))
 }
 
 fn ctor_tag_named(name: &str) -> Option<Value> {
     let names = locked_read(ctor_names());
-    names
-        .iter()
-        .find_map(|(tag, got)| (got == name).then_some(*tag))
+    let owner = match name {
+        "True" | "False" => Some("Bool"),
+        "Zero" | "Succ" => Some("Nat"),
+        "U32" => Some("U32"),
+        "F32" => Some("F32"),
+        "Chr" => Some("Char"),
+        "WNil" | "WCon" => Some("Word"),
+        "SNil" | "SCon" => Some("String"),
+        "ALeaf" | "ANode" => Some("Array"),
+        _ => None,
+    };
+    owner
+        .and_then(|owner| {
+            let qualified = format!("{owner}.{name}");
+            names.iter().find_map(|(tag, got)| {
+                (got == &qualified || got.ends_with(&format!(".{qualified}"))).then_some(*tag)
+            })
+        })
+        .or_else(|| {
+            names
+                .iter()
+                .find_map(|(tag, got)| (got == name).then_some(*tag))
+        })
         .or_else(|| {
             names
                 .iter()
@@ -458,30 +543,42 @@ fn locked_write<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 }
 
 fn nat(value: Value) -> u64 {
+    match value_tag(value) {
+        TAG_NAT => return value & PAYLOAD_MASK,
+        TAG_U32 => return value as u32 as u64,
+        _ => {}
+    }
     with_object(value, 0, |o| match o {
-        Object::Nat(n) => *n,
-        Object::U32(n) => *n as u64,
         _ => 0,
     })
 }
 
 fn u32_value(value: Value) -> u32 {
+    match value_tag(value) {
+        TAG_U32 => return value as u32,
+        TAG_NAT => return value as u32,
+        _ => {}
+    }
     with_object(value, 0, |o| match o {
-        Object::U32(n) => *n,
-        Object::Nat(n) => *n as u32,
         _ => 0,
     })
 }
 
 fn f32_value(value: Value) -> f32 {
+    match value_tag(value) {
+        TAG_F32 => return f32::from_bits(value as u32),
+        TAG_U32 => return (value as u32) as f32,
+        _ => {}
+    }
     with_object(value, 0.0, |o| match o {
-        Object::F32(n) => *n,
-        Object::U32(n) => *n as f32,
         _ => 0.0,
     })
 }
 
 fn bool_value(value: Value) -> bool {
+    if value_tag(value) == TAG_BOOL {
+        return value & 1 != 0;
+    }
     with_object(value, false, |o| match o {
         Object::Ctor(c) => locked_read(ctor_names())
             .get(&c.tag)
@@ -491,15 +588,32 @@ fn bool_value(value: Value) -> bool {
 }
 
 fn string_value(value: Value) -> String {
+    if value_tag(value) == TAG_CHAR {
+        return char::from_u32((value & PAYLOAD_MASK) as u32)
+            .unwrap_or('\0')
+            .to_string();
+    }
     with_object(value, String::new(), |o| match o {
         Object::String(s) => s.clone(),
-        Object::Char(c) => c.to_string(),
         _ => String::new(),
     })
 }
 
 fn bool_ctor(value: bool, yes: Value, no: Value) -> Value {
+    if is_builtin_bool_tags(yes, no) {
+        return bool_immediate(value);
+    }
     alloc_named_ctor(if value { yes } else { no }, Vec::new())
+}
+
+fn is_builtin_bool_tags(yes: Value, no: Value) -> bool {
+    let names = locked_read(ctor_names());
+    let is_named = |tag, suffix: &str| {
+        names
+            .get(&tag)
+            .is_some_and(|name| name == suffix || name.ends_with(&format!(".{suffix}")))
+    };
+    is_named(yes, "True") && is_named(no, "False")
 }
 
 fn cmp_ctor(ord: std::cmp::Ordering, lt: Value, eq: Value, gt: Value) -> Value {
@@ -530,12 +644,27 @@ fn f32_to_string(value: f32) -> String {
     if value == 0.0 && value.is_sign_negative() {
         return "-0".to_owned();
     }
-    let s = value.to_string();
-    s.replace("e+", "e")
-}
-
-fn nat_text(value: u64) -> String {
-    format!("{value}n")
+    let mut scientific = String::new();
+    let mut precision = 0;
+    for p in 0..9 {
+        scientific = format!("{value:.*e}", p);
+        precision = p;
+        if scientific.parse::<f32>().ok() == Some(value) {
+            break;
+        }
+    }
+    let (mantissa, exponent) = scientific.split_once('e').unwrap();
+    let exponent: i32 = exponent.parse().unwrap();
+    if exponent >= 21 || exponent <= -7 {
+        format!(
+            "{mantissa}e{}{exponent}",
+            if exponent >= 0 { "+" } else { "" }
+        )
+    } else if exponent <= precision as i32 {
+        format!("{value:.*}", (precision as i32 - exponent) as usize)
+    } else {
+        mantissa.replace('.', "") + &"0".repeat(exponent as usize - precision)
+    }
 }
 
 fn escaped_char(c: char, quote: char) -> String {
@@ -551,6 +680,173 @@ fn escaped_char(c: char, quote: char) -> String {
     }
 }
 
+fn registered_ctor_name(tag: Value, fallback: &str) -> String {
+    locked_read(ctor_names())
+        .get(&tag)
+        .cloned()
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn show_immediate(value: Value, depth: usize, seen: &mut HashSet<Value>) -> Option<String> {
+    Some(match value_tag(value) {
+        TAG_NAT => format!("{}n", value & PAYLOAD_MASK),
+        TAG_U32 => (value as u32).to_string(),
+        TAG_F32 => {
+            let text = f32_to_string(f32::from_bits(value as u32));
+            if text.contains('.') || text == "nan" || text.contains("inf") {
+                text
+            } else if let Some(at) = text.find('e') {
+                format!("{}.0{}", &text[..at], &text[at..])
+            } else {
+                format!("{text}.0")
+            }
+        }
+        TAG_CHAR => {
+            let c = char::from_u32((value & PAYLOAD_MASK) as u32).unwrap_or('\0');
+            format!("'{}'", escaped_char(c, '\''))
+        }
+        TAG_BOOL => {
+            if value & 1 != 0 {
+                "True{}".to_owned()
+            } else {
+                "False{}".to_owned()
+            }
+        }
+        TAG_WORD => {
+            let (length, bits) = word_parts(value)?;
+            if length == 0 {
+                let tag = ctor_tag_named("WNil").unwrap_or(0);
+                format!("{}{{}}", registered_ctor_name(tag, "WNil"))
+            } else {
+                let tag = ctor_tag_named("WCon").unwrap_or(0);
+                let name = registered_ctor_name(tag, "WCon");
+                let head = show_inner(bool_immediate(bits & 1 != 0), depth + 1, seen);
+                let tail = show_inner(word_immediate(length - 1, bits >> 1), depth + 1, seen);
+                format!("{name}{{{head}, {tail}}}")
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn ctor_has_registered_path(ctor: &Ctor, path: &str) -> bool {
+    if ctor.plain {
+        return false;
+    }
+    let name = locked_read(ctor_names())
+        .get(&ctor.tag)
+        .cloned()
+        .unwrap_or_default();
+    let short_path = path.rsplit('.').next().unwrap_or(path);
+    name == path || name.ends_with(&format!(".{path}")) || name == short_path
+}
+
+fn builtin_tuple_display(ctor: &Ctor) -> bool {
+    ctor_has_registered_path(ctor, "Sigma.Tuple") && ctor.fields.len() == 2
+}
+
+fn builtin_sigma_tuple_fields(value: Value) -> Option<Vec<Value>> {
+    with_object(value, None, |object| match object {
+        Object::Ctor(ctor)
+            if ctor_has_registered_path(ctor, "Sigma.Tuple") && ctor.fields.len() == 2 =>
+        {
+            Some(ctor.fields.clone())
+        }
+        _ => None,
+    })
+}
+
+fn show_sigma_tuple(value: Value, depth: usize, seen: &mut HashSet<Value>) -> String {
+    let mut fields = Vec::new();
+    let mut current = value;
+    let mut current_depth = depth;
+    let mut entered = Vec::new();
+    loop {
+        if current_depth > 256 {
+            fields.push("…".to_owned());
+            break;
+        }
+        if current != value {
+            if !seen.insert(current) {
+                fields.push("<cycle>".to_owned());
+                break;
+            }
+            entered.push(current);
+        }
+        let Some(pair) = builtin_sigma_tuple_fields(current) else {
+            fields.push(show_inner(current, current_depth + 1, seen));
+            break;
+        };
+        fields.push(show_inner(pair[0], current_depth + 1, seen));
+        let tail = pair[1];
+        if builtin_sigma_tuple_fields(tail).is_some() {
+            current = tail;
+            current_depth += 1;
+        } else {
+            fields.push(show_inner(tail, current_depth + 1, seen));
+            break;
+        }
+    }
+    for value in entered {
+        seen.remove(&value);
+    }
+    format!("({})", fields.join(", "))
+}
+
+fn builtin_list_fields(value: Value) -> Option<Option<Vec<Value>>> {
+    with_object(value, None, |object| match object {
+        Object::Ctor(ctor) if ctor_has_registered_path(ctor, "List.Nil") => Some(None),
+        Object::Ctor(ctor)
+            if ctor_has_registered_path(ctor, "List.Con") && ctor.fields.len() == 2 =>
+        {
+            Some(Some(ctor.fields.clone()))
+        }
+        _ => None,
+    })
+}
+
+fn show_builtin_list(value: Value, depth: usize, seen: &mut HashSet<Value>) -> String {
+    let mut fields = Vec::new();
+    let mut current = value;
+    let mut current_depth = depth;
+    let mut entered = Vec::new();
+    loop {
+        if current_depth > 256 {
+            fields.push("…".to_owned());
+            break;
+        }
+        if current != value {
+            if !seen.insert(current) {
+                fields.push("<cycle>".to_owned());
+                break;
+            }
+            entered.push(current);
+        }
+        match builtin_list_fields(current) {
+            Some(None) => break,
+            Some(Some(pair)) => {
+                fields.push(show_inner(pair[0], current_depth + 1, seen));
+                let tail = pair[1];
+                if builtin_list_fields(tail).is_some() {
+                    current = tail;
+                    current_depth += 1;
+                } else {
+                    fields.push(show_inner(tail, current_depth + 1, seen));
+                    break;
+                }
+            }
+            None => {
+                fields.push(show_inner(current, current_depth + 1, seen));
+                break;
+            }
+        }
+    }
+    for value in entered {
+        seen.remove(&value);
+    }
+    format!("[{}]", fields.join(", "))
+}
+
 fn show_inner(value: Value, depth: usize, seen: &mut HashSet<Value>) -> String {
     if value == 0 {
         return "()".to_owned();
@@ -561,60 +857,59 @@ fn show_inner(value: Value, depth: usize, seen: &mut HashSet<Value>) -> String {
     if !seen.insert(value) {
         return "<cycle>".to_owned();
     }
-    let out = with_object(value, "<?>".to_owned(), |object| match object {
-        Object::Nat(n) => nat_text(*n),
-        Object::U32(n) => n.to_string(),
-        Object::F32(n) => {
-            let text = f32_to_string(*n);
-            if text.contains('.') || text.contains('e') || text == "nan" || text.contains("inf") {
-                text
-            } else {
-                format!("{text}.0")
+    let out = if let Some(immediate) = show_immediate(value, depth, seen) {
+        immediate
+    } else {
+        with_object(value, "<?>".to_owned(), |object| match object {
+            Object::String(s) => format!(
+                "\"{}\"",
+                s.chars().map(|c| escaped_char(c, '"')).collect::<String>()
+            ),
+            Object::Ctor(ctor) => {
+                let name = locked_read(ctor_names())
+                    .get(&ctor.tag)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Ctor{}", ctor.tag));
+                if !ctor.plain && (name == "True" || name.ends_with(".True")) {
+                    "True{}".to_owned()
+                } else if !ctor.plain && (name == "False" || name.ends_with(".False")) {
+                    "False{}".to_owned()
+                } else if builtin_tuple_display(ctor) {
+                    show_sigma_tuple(value, depth, seen)
+                } else if ctor_has_registered_path(ctor, "List.Nil")
+                    || ctor_has_registered_path(ctor, "List.Con")
+                {
+                    show_builtin_list(value, depth, seen)
+                } else if ctor.fields.is_empty() {
+                    format!("{name}{{}}")
+                } else {
+                    format!(
+                        "{name}{{{}}}",
+                        ctor.fields
+                            .iter()
+                            .map(|field| show_inner(*field, depth + 1, seen))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
             }
-        }
-        Object::Char(c) => format!("'{}'", escaped_char(*c, '\'')),
-        Object::String(s) => format!(
-            "\"{}\"",
-            s.chars().map(|c| escaped_char(c, '"')).collect::<String>()
-        ),
-        Object::Ctor(ctor) => {
-            let name = locked_read(ctor_names())
-                .get(&ctor.tag)
-                .cloned()
-                .unwrap_or_else(|| format!("Ctor{}", ctor.tag));
-            let fields = ctor
-                .fields
-                .iter()
-                .map(|field| show_inner(*field, depth + 1, seen))
-                .collect::<Vec<_>>();
-            if name == "True" || name.ends_with(".True") {
-                "True{}".to_owned()
-            } else if name == "False" || name.ends_with(".False") {
-                "False{}".to_owned()
-            } else if name.ends_with("Tuple") || name == "Tuple" || name == "Pair" {
-                format!("({})", fields.join(", "))
-            } else if fields.is_empty() {
-                format!("{name}{{}}")
-            } else {
-                format!("{name}{{{}}}", fields.join(", "))
+            Object::Array(array) => {
+                let values = locked(&array.values).clone();
+                format!(
+                    "[{}]",
+                    values
+                        .iter()
+                        .map(|cell| show_inner(cell.value, depth + 1, seen))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
-        }
-        Object::Array(array) => {
-            let values = locked(&array.values).clone();
-            format!(
-                "[{}]",
-                values
-                    .iter()
-                    .map(|cell| show_inner(cell.value, depth + 1, seen))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-        Object::Closure(_) => "<function>".to_owned(),
-        Object::TailCall { .. } => "<tail call>".to_owned(),
-        Object::Task(_) => "<task>".to_owned(),
-        Object::IoAction { .. } => "<io action>".to_owned(),
-    });
+            Object::Closure(_) => "<function>".to_owned(),
+            Object::TailCall { .. } => "<tail call>".to_owned(),
+            Object::Task(_) => "<task>".to_owned(),
+            Object::IoAction { .. } => "<io action>".to_owned(),
+        })
+    };
     seen.remove(&value);
     out
 }
@@ -624,7 +919,7 @@ fn show(value: Value) -> String {
 }
 
 fn error_constructor(code: u32, message: String, fail_tag: Value, pair_tag: Value) -> Value {
-    let code = alloc(Object::U32(code));
+    let code = u32_result(code);
     let message = alloc(Object::String(message));
     let pair = tuple(pair_tag, code, message);
     alloc_named_ctor(fail_tag, vec![pair])
@@ -657,16 +952,14 @@ fn ctor_value(tag: Value, fields: Vec<Value>) -> Value {
     let suffix = name.rsplit('.').next().unwrap_or(&name);
     match suffix {
         "Unit" => 0,
-        "Zero" => alloc(Object::Nat(0)),
-        "Succ" => alloc(Object::Nat(
-            nat(fields.first().copied().unwrap_or(0)).saturating_add(1),
-        )),
-        "True" => alloc_named_ctor(tag, Vec::new()),
-        "False" => alloc_named_ctor(tag, Vec::new()),
+        "Zero" => nat_result(0),
+        "Succ" => nat_result(nat(fields.first().copied().unwrap_or(0)).saturating_add(1)),
+        "True" => bool_immediate(true),
+        "False" => bool_immediate(false),
         "Chr" => {
             let code = u32_value(fields.first().copied().unwrap_or(0));
             char::from_u32(code)
-                .map(|c| alloc(Object::Char(c)))
+                .map(char_immediate)
                 .unwrap_or_else(|| fail("invalid Unicode scalar value"))
         }
         "SNil" => alloc(Object::String(String::new())),
@@ -691,20 +984,29 @@ fn ctor_value(tag: Value, fields: Vec<Value>) -> Value {
                 values: Mutex::new(joined),
             }))
         }
-        "U32" => alloc(Object::U32(word_value(
+        "U32" => u32_result(word_value(fields.first().copied().unwrap_or(0))),
+        "F32" => f32_result(f32::from_bits(word_value(
             fields.first().copied().unwrap_or(0),
         ))),
-        "F32" => alloc(Object::F32(f32::from_bits(word_value(
-            fields.first().copied().unwrap_or(0),
-        )))),
+        "WNil" => word_immediate(0, 0),
+        "WCon" => {
+            let head = bool_value(fields.first().copied().unwrap_or(0));
+            if let Some((length, bits)) = compact_word(fields.get(1).copied().unwrap_or(0)) {
+                if length < 32 {
+                    return word_immediate(length + 1, (bits << 1) | head as u32);
+                }
+            }
+            alloc_named_ctor(tag, fields)
+        }
         _ => alloc_named_ctor(tag, fields),
     }
 }
 
 fn char_value(value: Value) -> char {
+    if value_tag(value) == TAG_CHAR {
+        return char::from_u32((value & PAYLOAD_MASK) as u32).unwrap_or('\0');
+    }
     with_object(value, '\0', |object| match object {
-        Object::Char(c) => *c,
-        Object::U32(n) => char::from_u32(*n).unwrap_or('\0'),
         Object::Ctor(ctor) if ctor.fields.first().is_some() => char_value(ctor.fields[0]),
         _ => '\0',
     })
@@ -747,12 +1049,11 @@ fn word_value(value: Value) -> u32 {
             bits(tail, bit + 1, out);
         }
     }
-    let direct = with_object(value, None, |object| match object {
-        Object::U32(n) => Some(*n),
-        _ => None,
-    });
-    if let Some(n) = direct {
-        return n;
+    if value_tag(value) == TAG_U32 {
+        return value as u32;
+    }
+    if let Some((_, bits)) = word_parts(value) {
+        return bits;
     }
     let mut out = 0;
     bits(value, 0, &mut out);
@@ -760,16 +1061,32 @@ fn word_value(value: Value) -> u32 {
 }
 
 fn word_from_u32(value: u32) -> Value {
-    let nil = ctor_tag_named("WNil").unwrap_or(0);
-    let cons = ctor_tag_named("WCon").unwrap_or(0);
-    let mut word = alloc_named_ctor(nil, Vec::new());
-    for bit in (0..32).rev() {
-        let yes = ctor_tag_named("True").unwrap_or(0);
-        let no = ctor_tag_named("False").unwrap_or(0);
-        let head = alloc_named_ctor(if value & (1 << bit) != 0 { yes } else { no }, Vec::new());
-        word = alloc_named_ctor(cons, vec![head, word]);
+    word_immediate(32, value)
+}
+
+fn compact_word(value: Value) -> Option<(u8, u32)> {
+    if let Some(parts) = word_parts(value) {
+        return Some(parts);
     }
-    word
+    with_object(value, None, |object| match object {
+        Object::Ctor(ctor) => {
+            let name = locked_read(ctor_names())
+                .get(&ctor.tag)
+                .cloned()
+                .unwrap_or_default();
+            let suffix = name.rsplit('.').next().unwrap_or(&name);
+            match suffix {
+                "WNil" => Some((0, 0)),
+                "WCon" => {
+                    let head = bool_value(ctor.fields.first().copied().unwrap_or(0));
+                    let (length, bits) = compact_word(ctor.fields.get(1).copied().unwrap_or(0))?;
+                    (length < 32).then_some((length + 1, (bits << 1) | head as u32))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    })
 }
 
 fn io_action_result(opcode: u64, a: Value, _b: Value) -> Value {
@@ -817,7 +1134,7 @@ fn io_action_result(opcode: u64, a: Value, _b: Value) -> Value {
                     .map(|_| u32::from_ne_bytes(bytes))
             });
             match got {
-                Ok(value) => alloc_named_ctor(done, vec![alloc(Object::U32(value))]),
+                Ok(value) => alloc_named_ctor(done, vec![u32_result(value)]),
                 Err(error) => error_constructor(
                     error.raw_os_error().unwrap_or(1) as u32,
                     error.to_string(),
@@ -907,7 +1224,7 @@ fn array_get_value(array: Value, index: Value, tuple_tag: Value, swap: Option<Va
 }
 
 fn f32_result(value: f32) -> Value {
-    alloc(Object::F32(value))
+    f32_immediate(value)
 }
 
 fn parse_f32_prefix(text: &str) -> Option<f32> {
@@ -984,10 +1301,10 @@ fn parse_f32_prefix(text: &str) -> Option<f32> {
 }
 
 fn u32_result(value: u32) -> Value {
-    alloc(Object::U32(value))
+    u32_immediate(value)
 }
 fn nat_result(value: u64) -> Value {
-    alloc(Object::Nat(value))
+    nat_immediate(value)
 }
 fn check_nat(value: u128) -> u64 {
     const NAT_MAX: u128 = (1u128 << 48) - 1;
@@ -1252,12 +1569,7 @@ pub extern "C" fn bend_op_f32_read(a: Value) -> Value {
     let text = string_value(a);
     let parsed = parse_f32_prefix(&text);
     let tag = ctor_tag_named(if parsed.is_some() { "Some" } else { "None" }).unwrap_or(0);
-    alloc_named_ctor(
-        tag,
-        parsed
-            .map(|x| vec![alloc(Object::F32(x))])
-            .unwrap_or_default(),
-    )
+    alloc_named_ctor(tag, parsed.map(|x| vec![f32_result(x)]).unwrap_or_default())
 }
 
 #[no_mangle]
@@ -1297,8 +1609,8 @@ pub extern "C" fn bend_op_nat_divmod(a: Value, b: Value, tag: Value) -> Value {
     let (a, b) = (nat(a), nat(b));
     tuple(
         tag,
-        alloc(Object::Nat(if b == 0 { 0 } else { a / b })),
-        alloc(Object::Nat(if b == 0 { a } else { a % b })),
+        nat_result(if b == 0 { 0 } else { a / b }),
+        nat_result(if b == 0 { a } else { a % b }),
     )
 }
 
@@ -1360,7 +1672,7 @@ pub extern "C" fn bend_op_array_size(array: Value, tag: Value) -> Value {
         Object::Array(a) => locked(&a.values).len() as u32,
         _ => 0,
     });
-    array_pair(tag, array, alloc(Object::U32(len)))
+    array_pair(tag, array, u32_result(len))
 }
 #[no_mangle]
 pub extern "C" fn bend_op_array_clone(array: Value, tag: Value) -> Value {
@@ -1404,11 +1716,11 @@ fn atomic_update(
                 _ => ov,
             };
             let new = if kind == 7 {
-                alloc(Object::F32(f32_value(old) + f32_value(operand)))
+                f32_result(f32_value(old) + f32_value(operand))
             } else if kind == 8 {
                 operand
             } else {
-                alloc(Object::U32(next))
+                u32_result(next)
             };
             values[at] = array_cell(new);
             old
@@ -1583,7 +1895,7 @@ pub extern "C" fn bend_plain_ctor(tag: Value, arity: Value, fields: *const Value
     } else {
         unsafe { std::slice::from_raw_parts(fields, n) }.to_vec()
     };
-    alloc_named_ctor(tag, values)
+    alloc_plain_ctor(tag, values)
 }
 
 #[no_mangle]
@@ -1599,6 +1911,29 @@ pub extern "C" fn bend_register_ctor(tag: Value, name: *const c_char, _arity: Va
 
 #[no_mangle]
 pub extern "C" fn bend_tag(value: Value) -> Value {
+    let tag = match value_tag(value) {
+        TAG_NAT => Some(
+            ctor_tag_named(if value & PAYLOAD_MASK == 0 {
+                "Zero"
+            } else {
+                "Succ"
+            })
+            .unwrap_or(0),
+        ),
+        TAG_U32 => Some(ctor_tag_named("U32").unwrap_or(0)),
+        TAG_F32 => Some(ctor_tag_named("F32").unwrap_or(0)),
+        TAG_CHAR => Some(ctor_tag_named("Chr").unwrap_or(0)),
+        TAG_BOOL => {
+            Some(ctor_tag_named(if value & 1 != 0 { "True" } else { "False" }).unwrap_or(0))
+        }
+        TAG_WORD => word_parts(value).map(|(length, _)| {
+            ctor_tag_named(if length == 0 { "WNil" } else { "WCon" }).unwrap_or(0)
+        }),
+        _ => None,
+    };
+    if let Some(tag) = tag {
+        return tag;
+    }
     with_object(value, 0, |object| match object {
         Object::Ctor(ctor) => ctor.tag,
         Object::String(s) => {
@@ -1608,56 +1943,65 @@ pub extern "C" fn bend_tag(value: Value) -> Value {
             let len = locked(&a.values).len();
             ctor_tag_named(if len == 1 { "ALeaf" } else { "ANode" }).unwrap_or(0)
         }
-        Object::Nat(n) => ctor_tag_named(if *n == 0 { "Zero" } else { "Succ" }).unwrap_or(0),
-        Object::U32(_) => ctor_tag_named("U32").unwrap_or(0),
-        Object::F32(_) => ctor_tag_named("F32").unwrap_or(0),
-        Object::Char(_) => ctor_tag_named("Chr").unwrap_or(0),
         _ => 0,
     })
 }
 
 #[no_mangle]
 pub extern "C" fn bend_field(value: Value, index: Value) -> Value {
-    let field = with_object(value, 0, |object| match object {
-        Object::Ctor(ctor) => ctor.fields.get(index as usize).copied().unwrap_or(0),
-        Object::Nat(n) if index == 0 && *n > 0 => alloc(Object::Nat(n - 1)),
-        Object::U32(n) if index == 0 => word_from_u32(*n),
-        Object::F32(n) if index == 0 => word_from_u32(n.to_bits()),
-        Object::Char(c) if index == 0 => alloc(Object::U32(*c as u32)),
-        Object::String(s) => match index {
-            0 => s
-                .chars()
-                .next()
-                .map(|c| alloc(Object::Char(c)))
-                .unwrap_or(0),
-            1 => s
-                .chars()
-                .next()
-                .map(|c| alloc(Object::String(s[c.len_utf8()..].to_owned())))
-                .unwrap_or(0),
-            _ => 0,
-        },
-        Object::Array(a) => {
-            let values = locked(&a.values);
-            if values.len() == 1 && index == 0 {
-                let field = values[0].value;
-                retain_in_current_region(field);
-                field
-            } else {
-                let mid = values.len() / 2;
-                let part = if index == 0 {
-                    &values[..mid]
-                } else if index == 1 {
-                    &values[mid..]
-                } else {
-                    return 0;
-                };
-                alloc(Object::Array(Array {
-                    values: Mutex::new(part.to_vec()),
-                }))
+    let immediate = match value_tag(value) {
+        TAG_NAT => Some(if index == 0 && value & PAYLOAD_MASK > 0 {
+            nat_result((value & PAYLOAD_MASK) - 1)
+        } else {
+            0
+        }),
+        TAG_U32 if index == 0 => Some(word_from_u32(value as u32)),
+        TAG_F32 if index == 0 => Some(word_from_u32(value as u32)),
+        TAG_CHAR if index == 0 => Some(u32_result((value & PAYLOAD_MASK) as u32)),
+        TAG_WORD => Some(match word_parts(value) {
+            Some((length, bits)) if index == 0 && length > 0 => bool_immediate(bits & 1 != 0),
+            Some((length, bits)) if index == 1 && length > 0 => {
+                word_immediate(length - 1, bits >> 1)
             }
-        }
-        _ => 0,
+            _ => 0,
+        }),
+        TAG_BOOL => Some(0),
+        _ => None,
+    };
+    let field = immediate.unwrap_or_else(|| {
+        with_object(value, 0, |object| match object {
+            Object::Ctor(ctor) => ctor.fields.get(index as usize).copied().unwrap_or(0),
+            Object::String(s) => match index {
+                0 => s.chars().next().map(char_immediate).unwrap_or(0),
+                1 => s
+                    .chars()
+                    .next()
+                    .map(|c| alloc(Object::String(s[c.len_utf8()..].to_owned())))
+                    .unwrap_or(0),
+                _ => 0,
+            },
+            Object::Array(a) => {
+                let values = locked(&a.values);
+                if values.len() == 1 && index == 0 {
+                    let field = values[0].value;
+                    retain_in_current_region(field);
+                    field
+                } else {
+                    let mid = values.len() / 2;
+                    let part = if index == 0 {
+                        &values[..mid]
+                    } else if index == 1 {
+                        &values[mid..]
+                    } else {
+                        return 0;
+                    };
+                    alloc(Object::Array(Array {
+                        values: Mutex::new(part.to_vec()),
+                    }))
+                }
+            }
+            _ => 0,
+        })
     });
     retain_in_current_region(field);
     field
@@ -1665,17 +2009,17 @@ pub extern "C" fn bend_field(value: Value, index: Value) -> Value {
 
 #[no_mangle]
 pub extern "C" fn bend_nat(value: Value) -> Value {
-    alloc(Object::Nat(value))
+    nat_immediate(value)
 }
 
 #[no_mangle]
 pub extern "C" fn bend_u32(value: u32) -> Value {
-    alloc(Object::U32(value))
+    u32_immediate(value)
 }
 
 #[no_mangle]
 pub extern "C" fn bend_f32(value: f32) -> Value {
-    alloc(Object::F32(value))
+    f32_immediate(value)
 }
 
 #[no_mangle]
@@ -1834,6 +2178,33 @@ mod tests {
     static OVERWRITE_DONE: AtomicBool = AtomicBool::new(false);
     const ARRAY_STRESS_LENGTH: u64 = 20_000;
 
+    #[test]
+    fn float_text_matches_native_roundtrip_and_literal_formatting() {
+        let cases = [
+            (0.0, "0", "0.0"),
+            (-0.0, "-0", "-0.0"),
+            (3.0, "3", "3.0"),
+            (0.1, "0.1", "0.1"),
+            (1e-6, "0.000001", "0.000001"),
+            (1e-7, "1e-7", "1.0e-7"),
+            (1e20, "100000000000000000000", "100000000000000000000.0"),
+            (1e21, "1e+21", "1.0e+21"),
+            (f32::INFINITY, "inf", "inf"),
+            (f32::NEG_INFINITY, "-inf", "-inf"),
+            (f32::NAN, "nan", "nan"),
+            (f32::from_bits(1), "1e-45", "1.0e-45"),
+            (f32::MAX, "3.4028235e+38", "3.4028235e+38"),
+        ];
+        for (value, text, literal) in cases {
+            assert_eq!(f32_to_string(value), text);
+            assert_eq!(show(f32_immediate(value)), literal);
+        }
+    }
+
+    unsafe extern "C" fn return_capture(env: Value, _: Value) -> Value {
+        bend_capture(env, 0)
+    }
+
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         locked(TEST_LOCK.get_or_init(|| Mutex::new(())))
     }
@@ -1853,8 +2224,8 @@ mod tests {
         thread::current().id().hash(&mut hasher);
         let thread_id = hasher.finish() as u32;
         let array = bend_capture(env, 0);
-        let index = alloc(Object::U32(u32_value(index)));
-        let value = alloc(Object::U32(thread_id));
+        let index = u32_result(u32_value(index));
+        let value = u32_result(thread_id);
         bend_op_array_set(array, index, value);
         if WAIT_FOR_PEER.load(Ordering::SeqCst) {
             PARALLEL_BARRIER.get_or_init(|| Barrier::new(2)).wait();
@@ -1867,7 +2238,7 @@ mod tests {
         let array = bend_capture(env, 0);
         let item = alloc(Object::String("survives callback".to_owned()));
         let boxed = bend_ctor(77, 1, &item);
-        let index = alloc(Object::U32(0));
+        let index = u32_result(0);
         bend_op_array_set(array, index, boxed);
         0
     }
@@ -1875,7 +2246,7 @@ mod tests {
     unsafe extern "C" fn store_captured_value(env: Value, _: Value) -> Value {
         let array = bend_capture(env, 0);
         let value = bend_capture(env, 1);
-        let index = alloc(Object::U32(0));
+        let index = u32_result(0);
         bend_op_array_set(array, index, value);
         0
     }
@@ -1916,7 +2287,7 @@ mod tests {
             NESTED_LEAVES.fetch_add(1, Ordering::SeqCst);
             return 0;
         }
-        let next = alloc(Object::U32(level - 1));
+        let next = u32_result(level - 1);
         let captures = [next];
         let left = closure(nested, &captures);
         let right = closure(nested, &captures);
@@ -1991,12 +2362,12 @@ mod tests {
         ACTIVE_CALLBACKS.store(0, Ordering::SeqCst);
         PEAK_CALLBACKS.store(0, Ordering::SeqCst);
         WAIT_FOR_PEER.store(true, Ordering::SeqCst);
-        let zeros = [alloc(Object::U32(0)), alloc(Object::U32(0))];
+        let zeros = [u32_result(0), u32_result(0)];
         let array = bend_array(2, zeros.as_ptr());
         let captures = [array];
         let worker = closure(record_thread, &captures);
         let task = bend_cpu_fork(worker);
-        let main_index = alloc(Object::U32(1));
+        let main_index = u32_result(1);
         bend_apply(worker, main_index);
         bend_cpu_join(task);
         WAIT_FOR_PEER.store(false, Ordering::SeqCst);
@@ -2039,12 +2410,12 @@ mod tests {
         THREAD_LIMIT.store(1, Ordering::SeqCst);
         ACTIVE_THREADS.store(1, Ordering::SeqCst);
         WAIT_FOR_PEER.store(false, Ordering::SeqCst);
-        let zeros = [alloc(Object::U32(0)), alloc(Object::U32(0))];
+        let zeros = [u32_result(0), u32_result(0)];
         let array = bend_array(2, zeros.as_ptr());
         let captures = [array];
         let worker = closure(record_thread, &captures);
         let task = bend_cpu_fork(worker);
-        let main_index = alloc(Object::U32(1));
+        let main_index = u32_result(1);
         bend_apply(worker, main_index);
         bend_cpu_join(task);
         let ids = array_values(array);
@@ -2065,8 +2436,8 @@ mod tests {
         let initial = bend_ctor(803, 1, &text);
         let values = [initial];
         let array = bend_array(values.len() as Value, values.as_ptr());
-        let index = alloc(Object::U32(0));
-        let length = alloc(Object::Nat(ARRAY_STRESS_LENGTH));
+        let index = u32_result(0);
+        let length = nat_result(ARRAY_STRESS_LENGTH);
         let captures = [array, index, length];
         let writer = closure(overwrite_loop, &captures);
         let task = bend_cpu_fork(writer);
@@ -2087,7 +2458,7 @@ mod tests {
         THREAD_LIMIT.store(2, Ordering::SeqCst);
         ACTIVE_THREADS.store(1, Ordering::SeqCst);
         NESTED_LEAVES.store(0, Ordering::SeqCst);
-        let depth = alloc(Object::U32(2));
+        let depth = u32_result(2);
         let captures = [depth];
         let task = bend_cpu_fork(closure(nested, &captures));
         bend_cpu_join(task);
@@ -2108,5 +2479,152 @@ mod tests {
         bend_register_ctor(902, c"IO.OP.Halt".as_ptr(), 2);
         let code = bend_io_run(closure(io_program, &[]));
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn scalar_immediates_roundtrip_through_constructors_and_boundaries() {
+        let _guard = guard();
+        for (tag, name, arity) in [
+            (910, "Bool.True", 0),
+            (911, "Bool.False", 0),
+            (912, "Nat.Zero", 0),
+            (913, "Nat.Succ", 1),
+            (914, "U32.U32", 1),
+            (915, "F32.F32", 1),
+            (916, "Char.Chr", 1),
+            (917, "Word.WNil", 0),
+            (918, "Word.WCon", 2),
+            (919, "User.True", 1),
+            (922, "Tuple", 2),
+            (923, "User.Tuple", 1),
+            (924, "Nil", 0),
+            (925, "Con", 2),
+        ] {
+            let name = std::ffi::CString::new(name).unwrap();
+            bend_register_ctor(tag, name.as_ptr(), arity);
+        }
+
+        let yes = bend_ctor(910, 0, std::ptr::null());
+        let no = bend_ctor(911, 0, std::ptr::null());
+        assert_eq!(yes, bool_immediate(true));
+        assert_eq!(no, bool_immediate(false));
+        assert_eq!(bend_tag(yes), 910);
+        assert_eq!(bend_tag(no), 911);
+        assert_eq!(show(yes), "True{}");
+        assert_eq!(show(no), "False{}");
+
+        let zero = bend_ctor(912, 0, std::ptr::null());
+        let five = nat_result(5);
+        let succ_fields = [five];
+        let six = bend_ctor(913, 1, succ_fields.as_ptr());
+        assert_eq!(zero, nat_immediate(0));
+        assert_eq!(six, nat_immediate(6));
+        assert_eq!(bend_tag(six), 913);
+        assert_eq!(bend_field(six, 0), five);
+        assert_eq!(show(six), "6n");
+
+        let word = word_from_u32(0xdead_beef);
+        let u32_fields = [word];
+        let boxed_u32 = bend_ctor(914, 1, u32_fields.as_ptr());
+        assert_eq!(boxed_u32, u32_immediate(0xdead_beef));
+        assert_eq!(bend_tag(boxed_u32), 914);
+        assert_eq!(
+            word_parts(bend_field(boxed_u32, 0)),
+            Some((32, 0xdead_beef))
+        );
+
+        let f32_bits = 1.25f32.to_bits();
+        let f32_fields = [word_from_u32(f32_bits)];
+        let boxed_f32 = bend_ctor(915, 1, f32_fields.as_ptr());
+        assert_eq!(boxed_f32, f32_immediate(1.25));
+        assert_eq!(bend_tag(boxed_f32), 915);
+        assert_eq!(word_parts(bend_field(boxed_f32, 0)), Some((32, f32_bits)));
+        let scaled = bend_op_f32_mul(f32_result(1.5), f32_result(2.0));
+        assert_eq!(f32_value(scaled), 3.0);
+        assert_eq!(u32_value(bend_op_f32_to_u32(scaled)), 3);
+        assert!(!bool_value(bend_op_u32_is_eq(
+            u32_result(1),
+            u32_result(2),
+            910,
+            911,
+        )));
+
+        let codepoint = u32_result('λ' as u32);
+        let char_fields = [codepoint];
+        let character = bend_ctor(916, 1, char_fields.as_ptr());
+        assert_eq!(character, char_immediate('λ'));
+        assert_eq!(bend_tag(character), 916);
+        assert_eq!(bend_field(character, 0), codepoint);
+        assert_eq!(string_value(character), "λ");
+
+        let empty = bend_ctor(917, 0, std::ptr::null());
+        let one_fields = [yes, empty];
+        let one = bend_ctor(918, 2, one_fields.as_ptr());
+        let two_fields = [no, one];
+        let two = bend_ctor(918, 2, two_fields.as_ptr());
+        assert_eq!(word_parts(empty), Some((0, 0)));
+        assert_eq!(word_parts(one), Some((1, 1)));
+        assert_eq!(word_parts(two), Some((2, 2)));
+        assert_eq!(bool_value(bend_field(two, 0)), false);
+        assert_eq!(bend_field(two, 1), one);
+        assert_eq!(word_value(two), 2);
+
+        let legacy_nil = bend_plain_ctor(917, 0, std::ptr::null());
+        let legacy_one_fields = [yes, legacy_nil];
+        let legacy_one = bend_plain_ctor(918, 2, legacy_one_fields.as_ptr());
+        assert!(is_handle(legacy_one));
+        assert_eq!(word_value(legacy_one), 1);
+        assert_eq!(bend_ctor(914, 1, [legacy_one].as_ptr()), u32_immediate(1));
+        assert_eq!(
+            bend_ctor(918, 2, legacy_one_fields.as_ptr()),
+            word_immediate(1, 1)
+        );
+        let legacy_two_fields = [no, legacy_one];
+        let legacy_two = bend_plain_ctor(918, 2, legacy_two_fields.as_ptr());
+        assert_eq!(show(two), show(legacy_two));
+
+        let user_true_fields = [u32_result(7)];
+        let same_name_user_ctor = bend_plain_ctor(919, 1, user_true_fields.as_ptr());
+        assert!(is_handle(same_name_user_ctor));
+        assert_eq!(bend_tag(same_name_user_ctor), 919);
+        assert_eq!(bend_field(same_name_user_ctor, 0), u32_result(7));
+        assert_eq!(show(same_name_user_ctor), "User.True{7}");
+
+        let user_tuple_fields = [u32_result(8)];
+        let user_tuple = bend_plain_ctor(923, 1, user_tuple_fields.as_ptr());
+        assert_eq!(show(user_tuple), "User.Tuple{8}");
+        let builtin_tuple_fields = [u32_result(7), u32_result(8)];
+        let builtin_tuple = bend_ctor(922, 2, builtin_tuple_fields.as_ptr());
+        assert_eq!(show(builtin_tuple), "(7, 8)");
+
+        let inner_tuple_fields = [u32_result(2), u32_result(3)];
+        let inner_tuple = bend_ctor(922, 2, inner_tuple_fields.as_ptr());
+        let right_nested_fields = [u32_result(1), inner_tuple];
+        let right_nested = bend_ctor(922, 2, right_nested_fields.as_ptr());
+        assert_eq!(show(right_nested), "(1, 2, 3)");
+        let nested_head_fields = [inner_tuple, u32_result(3)];
+        let nested_head = bend_ctor(922, 2, nested_head_fields.as_ptr());
+        assert_eq!(show(nested_head), "((2, 3), 3)");
+        let plain_builtin_tag = bend_plain_ctor(922, 2, right_nested_fields.as_ptr());
+        assert_eq!(show(plain_builtin_tag), "Tuple{1, (2, 3)}");
+
+        let nil = bend_ctor(924, 0, std::ptr::null());
+        let list_two_fields = [u32_result(2), nil];
+        let list_two = bend_ctor(925, 2, list_two_fields.as_ptr());
+        let list_one_fields = [u32_result(1), list_two];
+        let list_one = bend_ctor(925, 2, list_one_fields.as_ptr());
+        assert_eq!(show(list_one), "[1, 2]");
+        let plain_nil = bend_plain_ctor(924, 0, std::ptr::null());
+        let plain_list_fields = [u32_result(4), plain_nil];
+        let plain_list = bend_plain_ctor(925, 2, plain_list_fields.as_ptr());
+        assert_eq!(show(plain_list), "Con{4, Nil{}}");
+
+        let capture = [boxed_u32];
+        let identity = closure(return_capture, &capture);
+        assert_eq!(bend_apply(identity, 0), u32_immediate(0xdead_beef));
+        let array = bend_array(1, capture.as_ptr());
+        let pair = bend_op_array_get(array, u32_result(0), 920);
+        assert_eq!(bend_field(pair, 1), u32_immediate(0xdead_beef));
+        assert_eq!(show(array), "[3735928559]");
     }
 }
