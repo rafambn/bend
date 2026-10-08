@@ -22,6 +22,7 @@ import type { BunPlugin } from "bun";
 
 import * as Bend from "./bend.ts";
 import * as Comp from "./comp.ts";
+import * as LLVM from "./llvm.ts";
 import * as Safe from "./safe.ts";
 
 // Main
@@ -36,6 +37,9 @@ const VERSION = "2.0.36";
 const USAGE = [
   ["bend <file.bend> [args]", "check the file, then run main with args"],
   ["bend <file.bend> -o <out>", "build a binary, or C, JS, .mjs or BendTT by extension"],
+  ["bend <file.bend> -o <out.ll>", "emit LLVM IR directly"],
+  ["bend <file.bend> --llvm -o <out>", "build a CPU binary from LLVM IR"],
+  ["bend <file.bend> --llvm [args]", "build and run a CPU binary from LLVM IR"],
   ["bend <file.bend> --check-only", "check the file and its imports; run nothing"],
   ["bend <file.bend> --verdict", "check it, then recheck it with the proven kernel"],
   ["bend <file.bend> --publish [<name>@<version>]", "publish the file and its imports; a name needs login"],
@@ -237,6 +241,7 @@ async function cli_file(args: string[]): Promise<void> {
   let only = false;
   let verdict = false;
   let checkup = false;
+  let llvm = false;
   let publish = false;
   let named: string | undefined;
   for (let i = 0; i < args.length; i += 1) {
@@ -249,6 +254,8 @@ async function cli_file(args: string[]): Promise<void> {
       verdict = true;
     } else if (a === "--checkup") {
       checkup = true;
+    } else if (a === "--llvm") {
+      llvm = true;
     } else if (a === "--publish") {
       publish = true;
       if (args[i + 1]?.includes("@")) {
@@ -274,23 +281,26 @@ async function cli_file(args: string[]): Promise<void> {
     process.exit(1);
   }
   if (file.endsWith(".html")) {
-    if (outs.length !== 1 || only || checkup || publish) {
+    if (outs.length !== 1 || only || checkup || publish || llvm) {
       cli_fail("a page bundles with -o <dir>");
     }
     return cli_bundle(file, outs[0]);
   }
-  if (publish && (outs.length !== 0 || only || verdict || checkup)) {
+  if (publish && (outs.length !== 0 || only || verdict || checkup || llvm)) {
     cli_fail("--publish takes no other option");
   }
-  if ((only || verdict) && (outs.length !== 0 || checkup || (only && verdict))) {
+  if ((only || verdict) && (outs.length !== 0 || checkup || llvm || (only && verdict))) {
     cli_fail((verdict ? "--verdict" : "--check-only") + " takes no other option");
   }
   if (argv.length !== 0 && (outs.length !== 0 || only || checkup || publish)) {
     cli_fail("arguments go to a run: bend <file.bend> [args]");
   }
-  if (checkup && outs.length !== 0) {
+  if (checkup && (outs.length !== 0 || llvm)) {
     cli_fail("--checkup takes no -o: a binary holds one main, so build each"
       + " import alone");
+  }
+  if (llvm && outs.some((out) => /\.(?:c|m?js|cjs|bendtt)$/.test(out))) {
+    cli_fail("--llvm builds a binary or emits .ll; omit --llvm for C, JS or BendTT");
   }
   try {
     if (publish) {
@@ -306,17 +316,21 @@ async function cli_file(args: string[]): Promise<void> {
       return;
     }
     if (outs.length === 0) {
-      process.exitCode = book_run(book, [file, ...argv]);
+      process.exitCode = llvm ? llvm_run(book, file, argv)
+        : book_run(book, [file, ...argv]);
       return;
     }
     const ins = new Set([...seen.keys(), ...Object.values(book.tlds).flatMap((t) =>
       t.$ === "Def" && t.i !== undefined ? t.i.map(path_real) : [])]);
+    if (llvm && outs.some((out) => !out.endsWith(".ll"))) {
+      ins.add(path_real(path.join(Bend.BEND_DIR, "llvm_runtime.rs")));
+    }
     for (const out of outs) {
       const at = path_real(out);
       if (ins.has(at) || (fs.existsSync(at) && fs.statSync(at).isDirectory())) {
         cli_fail("-o " + out + " is a file the program reads, or a directory");
       }
-      cli_emit(book, out);
+      cli_emit(book, out, llvm);
     }
   } catch (e) {
     cli_say(2, book_err(e) + "\n");
@@ -359,8 +373,22 @@ function path_real(p: string): string {
   return fs.existsSync(p) ? fs.realpathSync(p) : path.resolve(p);
 }
 
-function cli_emit(book: Bend.Book, out: string): void {
-  if (out.endsWith(".mjs")) {
+function cli_emit(book: Bend.Book, out: string, llvm = false): void {
+  if (out.endsWith(".ll")) {
+    fs.writeFileSync(out, LLVM.compile_book(book));
+  } else if (llvm) {
+    if (book_main(book) === null) {
+      throw "Error: --llvm needs a main definition to build a binary";
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend-llvm-"));
+    const ir = path.join(dir, "program.ll");
+    try {
+      fs.writeFileSync(ir, LLVM.compile_book(book));
+      llvm_build(out, ir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  } else if (out.endsWith(".mjs")) {
     fs.writeFileSync(out, Comp.js_lib(book, true));
   } else if (/\.c?js$/.test(out)) {
     fs.writeFileSync(out, Comp.js_book(book));
@@ -381,6 +409,182 @@ function cli_emit(book: Bend.Book, out: string): void {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  }
+}
+
+type LLVM_Runtime = { file: string; libs: string[] };
+
+function llvm_run(book: Bend.Book, file: string, argv: string[]): number {
+  if (book_main(book) === null) {
+    throw "Error: --llvm needs a main definition";
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend-llvm-"));
+  const ir = path.join(dir, "program.ll");
+  const bin = path.join(dir, "program");
+  try {
+    fs.writeFileSync(ir, LLVM.compile_book(book));
+    llvm_build(bin, ir);
+    const got = child.spawnSync(bin, argv, { stdio: "inherit", argv0: file });
+    if (got.error !== undefined) {
+      throw "Error: could not run LLVM binary: " + got.error.message;
+    }
+    if (got.signal !== null) {
+      return 1;
+    }
+    return got.status ?? 1;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function llvm_build(bin: string, ir: string): void {
+  const clang = llvm_clang();
+  const standalone = /^; bend-runtime: none$/m.test(fs.readFileSync(ir, "utf8"));
+  const runtime = standalone ? null : llvm_runtime();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend-llvm-build-"));
+  const obj = path.join(dir, "program.o");
+  try {
+    const compile = child.spawnSync(clang, ["-O3", "-Wno-override-module",
+      "-x", "ir", "-c", ir, "-o", obj], { stdio: "inherit" });
+    if (compile.error !== undefined) {
+      throw "Error: could not run " + path.basename(clang) + ": " + compile.error.message;
+    }
+    if (compile.status !== 0) {
+      throw "Error: clang failed to compile LLVM IR";
+    }
+    // clang links libSystem by default on Darwin; libc and libm alias it.
+    // Keep the archive's other native arguments in their reported order.
+    const native = runtime?.libs ?? (process.platform === "linux" ? ["-lm"] : []);
+    const libs = process.platform === "darwin" && native.includes("-lSystem")
+      ? native.filter((arg) => !["-lSystem", "-lc", "-lm"].includes(arg))
+      : native;
+    const link = child.spawnSync(clang, ["-O3", obj, ...(runtime === null ? [] : [runtime.file]),
+      ...libs, "-o", path.resolve(bin)], { stdio: "inherit" });
+    if (link.error !== undefined) {
+      throw "Error: could not run " + path.basename(clang) + ": " + link.error.message;
+    }
+    if (link.status !== 0) {
+      throw "Error: clang failed to link the LLVM binary";
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function llvm_clang(): string {
+  const dirs = (process.env.PATH ?? "").split(path.delimiter);
+  const nums = [...new Set(dirs.flatMap((dir) => {
+    try {
+      return fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+  }).filter((f) => /^clang-\d+$/.test(f)))].sort((a, b) =>
+    Number(b.slice(6)) - Number(a.slice(6)));
+  const ccs = [...(process.env.LLVM_CC ? [process.env.LLVM_CC] : []), "clang", ...nums];
+  const seen = new Set<string>();
+  const old: string[] = [];
+  for (const cc of ccs) {
+    if (seen.has(cc)) {
+      continue;
+    }
+    seen.add(cc);
+    const got = child.spawnSync(cc, ["--version"], { encoding: "utf8" });
+    const out = (got.stdout ?? "") + (got.stderr ?? "");
+    const version = /(?:Apple )?clang version (\d+)/m.exec(out);
+    if (got.status === 0 && version !== null) {
+      if (Number(version[1]) >= 14) {
+        return cc;
+      }
+      old.push("clang " + version[1] + " as " + cc);
+    }
+  }
+  throw "Error: --llvm needs clang 14 or newer (found "
+    + (old.length === 0 ? "no clang" : old.join(", ")) + ")";
+}
+
+function llvm_runtime(): LLVM_Runtime {
+  const src = path.join(Bend.BEND_DIR, "llvm_runtime.rs");
+  if (!fs.existsSync(src)) {
+    throw "Error: --llvm needs the bend2/llvm_runtime.rs runtime source";
+  }
+  const rustc = process.env.RUSTC ?? "rustc";
+  const version = child.spawnSync(rustc, ["-vV"], { encoding: "utf8" });
+  const vout = (version.stdout ?? "") + (version.stderr ?? "");
+  if (version.error !== undefined || version.status !== 0) {
+    throw "Error: --llvm needs rustc on PATH or RUSTC set to rustc";
+  }
+  const source = fs.readFileSync(src);
+  const profile = crypto.createHash("sha256").update(source).update(vout)
+    .update(process.platform + " " + process.arch
+      + " --edition 2021 --crate-type staticlib --print native-static-libs"
+      + " -O -C panic=abort")
+    .digest("hex");
+  const uid = process.getuid?.() ?? "user";
+  const root = path.join(os.tmpdir(), "bend-llvm-runtime-" + uid);
+  const manifest = path.join(root, profile + ".json");
+  if (fs.existsSync(manifest)) {
+    try {
+      const key = JSON.parse(fs.readFileSync(manifest, "utf8")) as string;
+      if (/^[a-f0-9]{64}$/.test(key)) {
+        const cache = path.join(root, key);
+        const archive = path.join(cache, "libbend_llvm_runtime.a");
+        const meta = path.join(cache, "native.json");
+        if (fs.existsSync(archive) && fs.existsSync(meta)) {
+          const libs = JSON.parse(fs.readFileSync(meta, "utf8")) as string[];
+          return { file: archive, libs };
+        }
+      }
+    } catch {}
+  }
+  fs.mkdirSync(root, { recursive: true });
+  const build = fs.mkdtempSync(path.join(root, profile + "-"));
+  const output = path.join(build, "libbend_llvm_runtime.a");
+  try {
+    const got = child.spawnSync(rustc, ["--edition", "2021", "--crate-name",
+      "bend_llvm_runtime",
+      "--crate-type", "staticlib", "--print", "native-static-libs", "-O",
+      "-C", "panic=abort", src, "-o", output], { encoding: "utf8" });
+    const text = (got.stdout ?? "") + (got.stderr ?? "");
+    if (got.error !== undefined) {
+      throw "Error: could not run rustc: " + got.error.message;
+    }
+    if (got.status !== 0) {
+      throw "Error: rustc failed to build the LLVM runtime:\n" + text.trim();
+    }
+    const native = [...text.matchAll(/native-static-libs:\s*(.*)/g)].at(-1)?.[1];
+    if (native === undefined) {
+      throw "Error: rustc did not report the LLVM runtime's native link flags";
+    }
+    const libs = native.trim() === "(none)" ? [] : native.trim().split(/\s+/);
+    const key = crypto.createHash("sha256").update(profile)
+      .update(JSON.stringify(libs)).digest("hex");
+    const cache = path.join(root, key);
+    const archive = path.join(cache, "libbend_llvm_runtime.a");
+    const meta = path.join(cache, "native.json");
+    fs.writeFileSync(path.join(build, "native.json"), JSON.stringify(libs));
+    try {
+      fs.renameSync(build, cache);
+    } catch (e) {
+      if (!fs.existsSync(archive) || !fs.existsSync(meta)) {
+        throw e;
+      }
+      fs.rmSync(build, { recursive: true, force: true });
+    }
+    const manifest_tmp = path.join(root, profile + "." + process.pid + ".tmp");
+    fs.writeFileSync(manifest_tmp, JSON.stringify(key));
+    try {
+      fs.renameSync(manifest_tmp, manifest);
+    } catch (e) {
+      fs.rmSync(manifest_tmp, { force: true });
+      if (!fs.existsSync(manifest)) {
+        throw e;
+      }
+    }
+    return { file: archive, libs };
+  } catch (e) {
+    fs.rmSync(build, { recursive: true, force: true });
+    throw e;
   }
 }
 
